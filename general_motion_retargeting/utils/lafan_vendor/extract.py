@@ -25,19 +25,21 @@ class Anim(object):
     """
     A very basic animation object
     """
-    def __init__(self, quats, pos, offsets, parents, bones):
+    def __init__(self, quats, pos, offsets, parents, bones, frametime=None):
         """
         :param quats: local quaternions tensor
         :param pos: local positions tensor
         :param offsets: local joint offsets
         :param parents: bone hierarchy
         :param bones: bone names
+        :param frametime: seconds per frame (from BVH "Frame Time:" field)
         """
         self.quats = quats
         self.pos = pos
         self.offsets = offsets
         self.parents = parents
         self.bones = bones
+        self.frametime = frametime
 
 
 def read_bvh(filename, start=None, end=None, order=None):
@@ -68,7 +70,7 @@ def read_bvh(filename, start=None, end=None, order=None):
         if "HIERARCHY" in line: continue
         if "MOTION" in line: continue
 
-        rmatch = re.match(r"ROOT (\w+)", line)
+        rmatch = re.match(r"ROOT (\S+)", line)
         if rmatch:
             names.append(rmatch.group(1))
             offsets = np.append(offsets, np.array([[0, 0, 0]]), axis=0)
@@ -104,7 +106,7 @@ def read_bvh(filename, start=None, end=None, order=None):
                 order = "".join([channelmap[p] for p in parts])
             continue
 
-        jmatch = re.match("\s*JOINT\s+(\w+)", line)
+        jmatch = re.match(r"\s*JOINT\s+(\S+)", line)
         if jmatch:
             names.append(jmatch.group(1))
             offsets = np.append(offsets, np.array([[0, 0, 0]]), axis=0)
@@ -163,7 +165,7 @@ def read_bvh(filename, start=None, end=None, order=None):
     rotations = utils.euler_to_quat(np.radians(rotations), order=order)
     rotations = utils.remove_quat_discontinuities(rotations)
 
-    return Anim(rotations, positions, offsets, parents, names)
+    return Anim(rotations, positions, offsets, parents, names, frametime=frametime)
 
 
 def get_lafan1_set(bvh_path, actors, window=50, offset=20):

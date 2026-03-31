@@ -80,7 +80,7 @@ class GeneralMotionRetargeting:
         self.human_scale_table = ik_config["human_scale_table"]
         self.ground = ik_config["ground_height"] * np.array([0, 0, 1])
 
-        self.max_iter = 10
+        self.max_iter = 30
 
         self.solver = solver
         self.damping = damping
@@ -111,13 +111,14 @@ class GeneralMotionRetargeting:
         self.tasks2 = []
         
         for frame_name, entry in self.ik_match_table1.items():
-            body_name, pos_weight, rot_weight, pos_offset, rot_offset = entry
+            body_name, pos_weight, rot_weight, pos_offset, rot_offset, task_gain = self._parse_ik_entry(entry)
             if pos_weight != 0 or rot_weight != 0:
                 task = mink.FrameTask(
                     frame_name=frame_name,
                     frame_type="body",
                     position_cost=pos_weight,
                     orientation_cost=rot_weight,
+                    gain=task_gain,
                     lm_damping=1,
                 )
                 self.human_body_to_task1[body_name] = task
@@ -127,15 +128,16 @@ class GeneralMotionRetargeting:
                 )
                 self.tasks1.append(task)
                 self.task_errors1[task] = []
-        
+
         for frame_name, entry in self.ik_match_table2.items():
-            body_name, pos_weight, rot_weight, pos_offset, rot_offset = entry
+            body_name, pos_weight, rot_weight, pos_offset, rot_offset, task_gain = self._parse_ik_entry(entry)
             if pos_weight != 0 or rot_weight != 0:
                 task = mink.FrameTask(
                     frame_name=frame_name,
                     frame_type="body",
                     position_cost=pos_weight,
                     orientation_cost=rot_weight,
+                    gain=task_gain,
                     lm_damping=1,
                 )
                 self.human_body_to_task2[body_name] = task
@@ -146,7 +148,20 @@ class GeneralMotionRetargeting:
                 self.tasks2.append(task)
                 self.task_errors2[task] = []
 
-  
+    @staticmethod
+    def _parse_ik_entry(entry):
+        """Parse an IK config entry, supporting optional 6th gain element."""
+        if len(entry) == 5:
+            body_name, pos_weight, rot_weight, pos_offset, rot_offset = entry
+            task_gain = 1.0
+        elif len(entry) == 6:
+            body_name, pos_weight, rot_weight, pos_offset, rot_offset, task_gain = entry
+        else:
+            raise ValueError(
+                f"Invalid IK entry length {len(entry)}. Expected 5 or 6 values."
+            )
+        return body_name, pos_weight, rot_weight, pos_offset, rot_offset, task_gain
+
     def update_targets(self, human_data, offset_to_ground=False):
         # scale human data in local frame
         human_data = self.to_numpy(human_data)

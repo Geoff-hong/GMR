@@ -58,6 +58,15 @@ IK_CONFIG_DICT = {
     "bvh_nokov":{
         "unitree_g1": IK_CONFIG_ROOT / "bvh_nokov_to_g1.json",
     },
+    "bvh_axis":{
+        "unitree_g1": IK_CONFIG_ROOT / "bvh_axis_to_g1.json",
+    },
+    "bvh_mixamo":{
+        "unitree_g1": IK_CONFIG_ROOT / "bvh_lafan1_to_g1.json",
+    },
+    "bvh_3dsmax":{
+        "unitree_g1": IK_CONFIG_ROOT / "bvh_lafan1_to_g1.json",
+    },
     "bvh_xsens":{
         "unitree_g1": IK_CONFIG_ROOT / "bvh_xsens_to_g1.json",
         "unitree_h1_2": IK_CONFIG_ROOT / "bvh_xsens_to_h1_2.json",

@@ -22,7 +22,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--format",
-        choices=["lafan1", "nokov"],
+        choices=["lafan1", "nokov", "axis", "mixamo", "3dsmax"],
         default="lafan1",
     )
 

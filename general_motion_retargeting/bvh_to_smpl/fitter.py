@@ -131,18 +131,26 @@ class BatchSmplxFitter:
             return go_aa, body_aa, joint_R
 
         # -------- loss configurations per stage --------
-        # Stage A: just warm-up global orientation + translation with identity body pose.
+        # Loss terms are averaged over (T, ...). data term is per-joint squared Euclidean
+        # in metres^2, so realistic target magnitudes are O(1e-4) once per-joint RMS ~ 1cm.
+        # Priors are in axis-angle rad^2 and are scaled up unless data weight dominates,
+        # so we lift data weight relative to priors considerably from the previous version.
+        # Stage A: warm-up global orient + translation with identity body pose, no priors.
         w_A = Smpl3DLossWeights(
-            data=1.0, body_pose_l2=0.0, shape_l2=0.01, angle_prior=0.0,
+            data=100.0, body_pose_l2=0.0, shape_l2=0.01, angle_prior=0.0,
             smooth_rot=0.0, smooth_transl=0.0,
         )
-        # Stage B: activate body pose to fit limbs, very gentle regularisation so positions can match.
+        # Stage B: activate body pose, almost pure data fit so positions match tightly.
         w_B = Smpl3DLossWeights(
-            data=1.0, body_pose_l2=0.003, shape_l2=0.01, angle_prior=0.0,
-            smooth_rot=0.05, smooth_transl=0.01,
+            data=100.0, body_pose_l2=0.001, shape_l2=0.005, angle_prior=0.0,
+            smooth_rot=0.01, smooth_transl=0.001,
         )
-        # Stage C: tighten smoothness (mostly) and pose L2 without sacrificing data fit.
-        w_C = Smpl3DLossWeights()   # defaults (pose_l2=0.01, smooth_rot=0.2)
+        # Stage C: preserve data fit, enable temporal smoothness (which regularises rotations
+        # without biasing the mean pose); modest pose L2 to avoid wrap past pi.
+        w_C = Smpl3DLossWeights(
+            data=100.0, body_pose_l2=0.005, shape_l2=0.005, angle_prior=0.0,
+            smooth_rot=0.1, smooth_transl=0.005,
+        )
 
         loss_A = Smpl3DFittingLoss(w_A, self._jw_tensor).to(self.device)
         loss_B = Smpl3DFittingLoss(w_B, self._jw_tensor).to(self.device)

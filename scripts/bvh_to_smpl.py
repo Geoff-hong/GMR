@@ -147,6 +147,41 @@ def main() -> None:
         frames, bvh_path=args.bvh_file,
         drop_calibration_frame=not args.keep_axis_calibration_frame,
     )
+
+    # Per-joint fit priorities. NEUTRAL SMPL-X body has structurally mismatched bone
+    # lengths vs the 1.85m demonstrator (pelvis->spine1 is 29% shorter in BVH,
+    # neck->head is 41% shorter, thighs are 13% longer). betas can compensate PCA shape
+    # but not these topology differences. We push residual error into spine/head (invisible
+    # to viewers) by down-weighting those joints, while up-weighting limbs (ankles,
+    # knees, wrists, elbows) to keep visible kinematics tight.
+    JOINT_WEIGHT_OVERRIDES = {
+        0: 1.0,   # pelvis  (root; keep at 1)
+        1: 1.5,   # L_hip
+        2: 1.5,   # R_hip
+        3: 0.3,   # spine1  (topology-mismatched)
+        4: 2.0,   # L_knee  (visible)
+        5: 2.0,   # R_knee
+        6: 0.5,   # spine2
+        7: 2.0,   # L_ankle (most visible — user's focus)
+        8: 2.0,   # R_ankle
+        9: 0.5,   # spine3
+        10: 1.5,  # L_foot  (toe tip)
+        11: 1.5,  # R_foot
+        12: 0.5,  # neck    (topology-mismatched)
+        13: 0.7,  # L_collar
+        14: 0.7,  # R_collar
+        15: 0.3,  # head    (topology-mismatched, BVH head = neck-base)
+        16: 1.5,  # L_shoulder
+        17: 1.5,  # R_shoulder
+        18: 1.5,  # L_elbow
+        19: 1.5,  # R_elbow
+        20: 2.0,  # L_wrist
+        21: 2.0,  # R_wrist
+    }
+    for j, w in JOINT_WEIGHT_OVERRIDES.items():
+        if weights[j] > 0:  # don't turn ON a joint we'd zeroed (end-site failure)
+            weights[j] = w
+    print(f"  joint weights applied: {weights.tolist()}")
     print(f"  gt_joints: {gt_joints.shape}  dtype={gt_joints.dtype}")
     print(f"  fit-joint weights: 1={int((weights==1).sum())}  0={int((weights==0).sum())}")
 

@@ -154,25 +154,9 @@ def main() -> None:
         smpl_model_dir=str(args.smpl_model_dir),
         gender=args.gender,
         device=args.device,
-        n_iters_init=args.n_iters_init,
-        n_iters_refine=args.n_iters_refine,
     )
-    fitter = BatchSmplxFitter(cfg)
-    # Inject custom joint weights (fitter currently uses defaults; patch its loss module).
-    import torch
-    from general_motion_retargeting.bvh_to_smpl import loss as loss_mod
-    # Monkey-patch by passing weights into the fit
-    orig_loss_cls = loss_mod.Smpl3DFittingLoss
-
-    def _loss_with_weights(*a, **kw):
-        kw.setdefault("joint_weights", torch.as_tensor(weights))
-        return orig_loss_cls(*a, **kw)
-
-    loss_mod.Smpl3DFittingLoss = _loss_with_weights
-    try:
-        result = fitter.fit_clip(gt_joints, fps=float(bvh_fps))
-    finally:
-        loss_mod.Smpl3DFittingLoss = orig_loss_cls
+    fitter = BatchSmplxFitter(cfg).with_joint_weights(weights)
+    result = fitter.fit_clip(gt_joints, fps=float(bvh_fps))
 
     pose_aa = pack_pose_aa_72(result["global_orient"], result["body_pose"])
     transl = result["transl"]

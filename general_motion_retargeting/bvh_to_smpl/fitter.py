@@ -1,13 +1,20 @@
-"""Batched SMPL-X fitter from 3D joint observations.
+"""Batched SMPL-X fitter: 6-D rotation parameterisation, multi-stage Adam.
 
-Approach: cast one whole motion clip's SMPL-X parameters as learnable tensors
-and run PyTorch Adam to jointly optimise all frames. Much faster than SMPLify-X's
-per-frame L-BFGS (seconds per clip instead of minutes) at the cost of slightly
-less tight convergence per frame.
-
-Two-stage schedule (inspired by SMPLify-X's weight staging):
-  Stage A (init):   high data weight, priors off / small -> pure positional fit
-  Stage B (refine): data weight down a notch, priors + smoothness on
+Improvements vs v2:
+  * **6-D rotation parameterisation** for global_orient and all 21 body joints.
+    Axis-angle has a wrap discontinuity at |theta|=pi; Adam was drifting past
+    this boundary (v2 produced a 3.9-rad R_knee and a 3.5-rad R_elbow because
+    the optimiser moved along "the long way around"). 6-D is globally
+    continuous, so the optimiser stays near identity at rest and smoothly
+    accumulates rotation.
+  * **Three-stage schedule** (A global translation/orient warm-up, B positional
+    fit with gentle priors, C final tightening with smoothness + hinge).
+  * **Warm-start global_orient** from the pelvis-to-chest axis of the observed
+    joints so the body is roughly upright before stage B, which is critical
+    since 6-D starting from identity is very far from a facing-backward pose.
+  * Passes rotation matrices (not just axis-angle) to the loss so that
+    temporal smoothness and hinge penalties operate in SO(3) where they are
+    well-defined.
 """
 from __future__ import annotations
 
@@ -18,28 +25,37 @@ import smplx
 import torch
 
 from .loss import Smpl3DFittingLoss, Smpl3DLossWeights
+from .rotations import (
+    axis_angle_to_matrix,
+    axis_angle_to_rot6d,
+    identity_rot6d,
+    matrix_to_axis_angle,
+    rot6d_to_matrix,
+)
 
 
 @dataclass
 class FitterConfig:
-    smpl_model_dir: str               # directory containing models/smplx/SMPLX_*.pkl
-    gender: str = "neutral"           # "neutral" | "male" | "female"
+    smpl_model_dir: str
+    gender: str = "neutral"
     num_betas: int = 10
     device: str = "cuda"
-    n_iters_init: int = 200
-    n_iters_refine: int = 400
-    lr_init: float = 0.05
-    lr_refine: float = 0.01
-    fit_joint_count: int = 22         # we fit against the 22 body joints (SMPL 0..21)
+    n_iters_A: int = 120          # stage A: global warm-up only
+    n_iters_B: int = 300          # stage B: body fit, gentle priors
+    n_iters_C: int = 400          # stage C: full priors + smoothness
+    lr_A: float = 0.05
+    lr_B: float = 0.03
+    lr_C: float = 0.005
+    fit_joint_count: int = 22
     log_every: int = 50
 
 
 class BatchSmplxFitter:
-    """Fit SMPL-X (global_orient, body_pose, transl, shared betas) to 3D joint targets."""
-
     def __init__(self, cfg: FitterConfig):
         self.cfg = cfg
         self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+
+    # ----- model / forward helpers -----
 
     def _make_model(self, batch_size: int) -> smplx.SMPLX:
         return smplx.create(
@@ -53,95 +69,174 @@ class BatchSmplxFitter:
             batch_size=batch_size,
         ).to(self.device)
 
-    def _forward_joints(self, model, global_orient, body_pose, transl, betas):
-        """SMPL-X forward pass; return only the first N fit joints."""
-        out = model(
-            betas=betas.expand(global_orient.shape[0], -1),
-            global_orient=global_orient,
-            body_pose=body_pose,
+    def _forward(
+        self,
+        model,
+        go_aa: torch.Tensor,        # (T, 3) axis-angle from 6-D
+        body_aa: torch.Tensor,      # (T, 63)
+        transl: torch.Tensor,       # (T, 3)
+        betas: torch.Tensor,        # (1, num_betas)
+    ):
+        T = go_aa.shape[0]
+        return model(
+            betas=betas.expand(T, -1),
+            global_orient=go_aa,
+            body_pose=body_aa,
             transl=transl,
             return_verts=False,
         )
-        return out.joints[:, : self.cfg.fit_joint_count]  # (T, 22, 3)
+
+    # ----- initialisation -----
+    # NOTE: we do NOT warm-start global_orient any more. An earlier heuristic
+    # that aligned SMPL-X's rest spine (+Y in model frame) to the observed
+    # spine direction in world Z-up was locally correct in pitch but left
+    # the yaw (facing direction) unresolved, producing a body pointed 180 deg
+    # away from the demonstrator. Stage A then had to bend hips/knees to
+    # huge angles (>100 deg) to compensate. Leaving go_r6 at identity and
+    # letting Adam walk the full SO(3) manifold during stage A is empirically
+    # more reliable with the strong body_pose L2 + smooth_rot priors added
+    # in this version.
+
+    # ----- main fit -----
 
     def fit_clip(self, gt_joints_3d: np.ndarray, fps: float) -> dict:
         """
-        Args:
-            gt_joints_3d: (T, 22, 3) float array — BVH-derived 3D joint world positions
-                          (first 22 SMPL body joints). Y-up, metres.
-            fps:          input fps
-        Returns dict with fit parameters and forward-pass joints, all as numpy.
+        gt_joints_3d: (T, 22, 3) float, same world frame as SMPL-X output (joints + transl).
         """
         assert gt_joints_3d.ndim == 3 and gt_joints_3d.shape[1] == self.cfg.fit_joint_count
         T = gt_joints_3d.shape[0]
-
-        model = self._make_model(batch_size=T)
-
+        model = self._make_model(T)
         gt = torch.as_tensor(gt_joints_3d, dtype=torch.float32, device=self.device)
 
-        # Parameters (learnable)
-        global_orient = torch.zeros(T, 3, device=self.device, requires_grad=True)
-        body_pose = torch.zeros(T, 21 * 3, device=self.device, requires_grad=True)
+        # -------- initialise --------
+        # Start from identity rotations; Adam finds global_orient in stage A.
+        go_r6 = identity_rot6d(T, device=self.device).requires_grad_(True)             # (T, 6)
+        body_r6 = identity_rot6d(T, 21, device=self.device).requires_grad_(True)       # (T, 21, 6)
         betas = torch.zeros(1, self.cfg.num_betas, device=self.device, requires_grad=True)
-        # Initialise transl with the pelvis target minus SMPL-X rest pelvis offset (-0.35m Y).
+
+        # Initial transl: pelvis target minus rest pelvis offset, computed with betas=0
         with torch.no_grad():
-            rest_out = model(betas=torch.zeros(1, self.cfg.num_betas, device=self.device))
-            pelvis_rest = rest_out.joints[0, 0].clone()  # (3,)
-        transl_init = gt[:, 0] - pelvis_rest.unsqueeze(0)
+            rest = model(betas=torch.zeros(1, self.cfg.num_betas, device=self.device))
+            rest_pelvis = rest.joints[0, 0].clone()
+        transl_init = gt[:, 0] - rest_pelvis.unsqueeze(0)
         transl = transl_init.detach().clone().requires_grad_(True)
 
-        # ----- Stage A: positional-only, fast convergence -----
-        loss_A = Smpl3DFittingLoss(weights=Smpl3DLossWeights(
-            data=1.0, shape=0.005, angle=0.0, smoothness_pose=0.0, smoothness_transl=0.0,
-        ))
-        opt_A = torch.optim.Adam([global_orient, body_pose, transl, betas], lr=self.cfg.lr_init)
-        print(f"[fitter] Stage A: {self.cfg.n_iters_init} iters, lr={self.cfg.lr_init}")
-        for it in range(self.cfg.n_iters_init):
+        def pack_axis_angle():
+            """Compute (go_aa, body_aa, joint_R) from the 6-D parameters."""
+            go_R = rot6d_to_matrix(go_r6)                    # (T, 3, 3)
+            body_R = rot6d_to_matrix(body_r6)                # (T, 21, 3, 3)
+            go_aa = matrix_to_axis_angle(go_R)               # (T, 3)
+            body_aa = matrix_to_axis_angle(body_R).reshape(T, 63)
+            joint_R = torch.cat([go_R.unsqueeze(1), body_R], dim=1)  # (T, 22, 3, 3)
+            return go_aa, body_aa, joint_R
+
+        # -------- loss configurations per stage --------
+        # Stage A: just warm-up global orientation + translation with identity body pose.
+        w_A = Smpl3DLossWeights(
+            data=1.0, body_pose_l2=0.0, shape_l2=0.01, angle_prior=0.0,
+            smooth_rot=0.0, smooth_transl=0.0,
+        )
+        # Stage B: activate body pose to fit limbs, very gentle regularisation so positions can match.
+        w_B = Smpl3DLossWeights(
+            data=1.0, body_pose_l2=0.003, shape_l2=0.01, angle_prior=0.0,
+            smooth_rot=0.05, smooth_transl=0.01,
+        )
+        # Stage C: tighten smoothness (mostly) and pose L2 without sacrificing data fit.
+        w_C = Smpl3DLossWeights()   # defaults (pose_l2=0.01, smooth_rot=0.2)
+
+        loss_A = Smpl3DFittingLoss(w_A, self._jw_tensor).to(self.device)
+        loss_B = Smpl3DFittingLoss(w_B, self._jw_tensor).to(self.device)
+        loss_C = Smpl3DFittingLoss(w_C, self._jw_tensor).to(self.device)
+
+        # -------- stage A: freeze body rotations, only optimise global_orient + transl --------
+        # (equivalent to optimising just the "where is the body" part)
+        body_r6_frozen = body_r6.detach()
+        opt_A = torch.optim.Adam([go_r6, transl, betas], lr=self.cfg.lr_A)
+        print(f"[fitter] stage A: global orient + transl, {self.cfg.n_iters_A} iters")
+        for it in range(self.cfg.n_iters_A):
             opt_A.zero_grad()
-            pred = self._forward_joints(model, global_orient, body_pose, transl, betas)
-            total, logs = loss_A(pred, gt, betas, body_pose, transl)
+            go_aa, body_aa, joint_R = pack_axis_angle()
+            # replace body_r6 rotation with frozen identity (by nullifying its gradient path)
+            body_aa_frozen = matrix_to_axis_angle(rot6d_to_matrix(body_r6_frozen)).reshape(T, 63)
+            body_aa_frozen = body_aa_frozen.detach()
+            out = self._forward(model, go_aa, body_aa_frozen, transl, betas)
+            pred = out.joints[:, : self.cfg.fit_joint_count]
+            body_pose_aa = body_aa_frozen.reshape(T, 21, 3)
+            joint_R_A = torch.cat(
+                [rot6d_to_matrix(go_r6).unsqueeze(1), rot6d_to_matrix(body_r6_frozen).expand(T, -1, -1, -1)],
+                dim=1,
+            )
+            total, logs = loss_A(pred, gt, betas, body_pose_aa, joint_R_A, transl)
             total.backward()
             opt_A.step()
-            if it % self.cfg.log_every == 0 or it == self.cfg.n_iters_init - 1:
-                print(f"  A it={it:4d}  total={logs['total']:.4f}  data={logs['data']:.4f}")
+            if it % self.cfg.log_every == 0 or it == self.cfg.n_iters_A - 1:
+                print(f"  A it={it:3d}  total={logs['total']:.4f}  data={logs['data']:.4f}")
 
-        # ----- Stage B: priors + smoothness -----
-        loss_B = Smpl3DFittingLoss(weights=Smpl3DLossWeights())  # defaults
-        opt_B = torch.optim.Adam([global_orient, body_pose, transl, betas], lr=self.cfg.lr_refine)
-        print(f"[fitter] Stage B: {self.cfg.n_iters_refine} iters, lr={self.cfg.lr_refine}")
-        for it in range(self.cfg.n_iters_refine):
+        # -------- stage B: body pose + priors, gentle smoothness --------
+        opt_B = torch.optim.Adam([go_r6, body_r6, transl, betas], lr=self.cfg.lr_B)
+        print(f"[fitter] stage B: body fit, {self.cfg.n_iters_B} iters")
+        for it in range(self.cfg.n_iters_B):
             opt_B.zero_grad()
-            pred = self._forward_joints(model, global_orient, body_pose, transl, betas)
-            total, logs = loss_B(pred, gt, betas, body_pose, transl)
+            go_aa, body_aa, joint_R = pack_axis_angle()
+            out = self._forward(model, go_aa, body_aa, transl, betas)
+            pred = out.joints[:, : self.cfg.fit_joint_count]
+            body_pose_aa = body_aa.reshape(T, 21, 3)
+            total, logs = loss_B(pred, gt, betas, body_pose_aa, joint_R, transl)
             total.backward()
             opt_B.step()
-            if it % self.cfg.log_every == 0 or it == self.cfg.n_iters_refine - 1:
+            if it % self.cfg.log_every == 0 or it == self.cfg.n_iters_B - 1:
                 print(
-                    f"  B it={it:4d}  total={logs['total']:.4f}  data={logs['data']:.4f}"
-                    f"  smooth_pose={logs['smooth_pose']:.4f}  shape={logs['shape']:.4f}"
+                    f"  B it={it:3d}  tot={logs['total']:.4f}  data={logs['data']:.4f} "
+                    f"pose_l2={logs['pose_l2']:.3f} knee={logs['knee_hinge']:.3f} "
+                    f"ankle_twist={logs['ankle_twist']:.3f} smooth_rot={logs['smooth_rot']:.3f}"
                 )
 
+        # -------- stage C: full priors + strong smoothness --------
+        opt_C = torch.optim.Adam([go_r6, body_r6, transl, betas], lr=self.cfg.lr_C)
+        print(f"[fitter] stage C: refine w/ priors + smoothness, {self.cfg.n_iters_C} iters")
+        for it in range(self.cfg.n_iters_C):
+            opt_C.zero_grad()
+            go_aa, body_aa, joint_R = pack_axis_angle()
+            out = self._forward(model, go_aa, body_aa, transl, betas)
+            pred = out.joints[:, : self.cfg.fit_joint_count]
+            body_pose_aa = body_aa.reshape(T, 21, 3)
+            total, logs = loss_C(pred, gt, betas, body_pose_aa, joint_R, transl)
+            total.backward()
+            opt_C.step()
+            if it % self.cfg.log_every == 0 or it == self.cfg.n_iters_C - 1:
+                print(
+                    f"  C it={it:3d}  tot={logs['total']:.4f}  data={logs['data']:.4f} "
+                    f"pose_l2={logs['pose_l2']:.3f} knee={logs['knee_hinge']:.3f} "
+                    f"elbow={logs['elbow_hinge']:.3f} ankle_twist={logs['ankle_twist']:.3f} "
+                    f"smooth_rot={logs['smooth_rot']:.3f}"
+                )
+
+        # -------- final forward pass (transl=0 for SONIC model-frame joints) --------
         with torch.no_grad():
-            # Forward with transl=0 so joints are in SMPL-X model frame.
-            # SONIC's smpl_filtered schema stores joints WITHOUT transl applied
-            # (pelvis ends up at ~(0, -0.35, 0), the SMPL-X rest pelvis offset),
-            # and pairs it with transl separately. World position = joints + transl.
+            go_aa, body_aa, _ = pack_axis_angle()
             final = model(
                 betas=betas.expand(T, -1),
-                global_orient=global_orient,
-                body_pose=body_pose,
+                global_orient=go_aa,
+                body_pose=body_aa,
                 transl=torch.zeros_like(transl),
                 return_verts=False,
             )
-            all_joints = final.joints[:, : self.cfg.fit_joint_count].detach().cpu().numpy()
+            joints_mf = final.joints[:, : self.cfg.fit_joint_count].detach().cpu().numpy()
             hand_proxy = final.joints[:, 20:22].detach().cpu().numpy()
-            smpl_joints_24 = np.concatenate([all_joints, hand_proxy], axis=1)  # (T, 24, 3)
+            smpl_joints_24 = np.concatenate([joints_mf, hand_proxy], axis=1)
 
         return {
-            "global_orient": global_orient.detach().cpu().numpy(),       # (T, 3)
-            "body_pose": body_pose.detach().cpu().numpy(),               # (T, 63)
-            "transl": transl.detach().cpu().numpy(),                     # (T, 3)
-            "betas": betas.detach().cpu().numpy()[0],                    # (10,)
-            "smpl_joints": smpl_joints_24,                               # (T, 24, 3)
+            "global_orient": go_aa.detach().cpu().numpy(),
+            "body_pose": body_aa.detach().cpu().numpy(),
+            "transl": transl.detach().cpu().numpy(),
+            "betas": betas.detach().cpu().numpy()[0],
+            "smpl_joints": smpl_joints_24,
             "fps": float(fps),
         }
+
+    # joint weights buffer (used when the CLI monkey-patches via attr)
+    _jw_tensor: torch.Tensor | None = None
+
+    def with_joint_weights(self, w: np.ndarray) -> "BatchSmplxFitter":
+        self._jw_tensor = torch.as_tensor(w, dtype=torch.float32)
+        return self

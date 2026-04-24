@@ -5,9 +5,16 @@ import general_motion_retargeting.utils.lafan_vendor.utils as utils
 from general_motion_retargeting.utils.lafan_vendor.extract import read_bvh
 
 
-def load_bvh_file(bvh_file, format="lafan1", human_height_override=None):
+def load_bvh_file(bvh_file, format="lafan1", human_height_override=None, drop_calibration_frame=True):
     """
     Load a BVH file and return per-frame joint data, human height, and fps.
+
+    Args:
+        drop_calibration_frame: when format == "axis" and this is True (default), drop BVH
+            frame 0. Noitom / Axis Studio exports prepend an all-zero-rotation T-pose frame
+            (root at subject hip-height above world origin, every joint angle zero) that is
+            NOT part of the captured motion. Leaving it in produces a 1-2 m teleport + 180°
+            flip between frames 0 and 1, which downstream tracking policies cannot handle.
 
     Returns:
         frames: list of dicts mapping joint name -> [position, orientation]
@@ -64,6 +71,9 @@ def load_bvh_file(bvh_file, format="lafan1", human_height_override=None):
             raise ValueError(f"Invalid format: {format}")
 
         frames.append(result)
+
+    if format == "axis" and drop_calibration_frame and len(frames) > 1:
+        frames = frames[1:]
 
     if human_height_override is not None:
         human_height = human_height_override

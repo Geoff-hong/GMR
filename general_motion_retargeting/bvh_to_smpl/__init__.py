@@ -16,6 +16,7 @@ from .joint_mapping import (
     SMPL_PARENTS,
     SMPLX_NUM_BODY_JOINTS_FIT,
 )
+from .end_sites import compute_axis_bvh_end_site_world, parse_end_site_offsets
 
 __all__ = [
     "AXIS_BVH_TO_SMPL",
@@ -23,4 +24,6 @@ __all__ = [
     "SMPL_JOINT_NAMES",
     "SMPL_PARENTS",
     "SMPLX_NUM_BODY_JOINTS_FIT",
+    "compute_axis_bvh_end_site_world",
+    "parse_end_site_offsets",
 ]

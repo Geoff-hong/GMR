@@ -22,7 +22,11 @@ from pathlib import Path
 
 import numpy as np
 
-from general_motion_retargeting.bvh_to_smpl import AXIS_BVH_TO_SMPL, SMPL_NUM_JOINTS
+from general_motion_retargeting.bvh_to_smpl import (
+    AXIS_BVH_TO_SMPL,
+    SMPL_NUM_JOINTS,
+    compute_axis_bvh_end_site_world,
+)
 from general_motion_retargeting.bvh_to_smpl.fitter import BatchSmplxFitter, FitterConfig
 from general_motion_retargeting.utils.lafan1 import load_bvh_file
 
@@ -49,18 +53,30 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def extract_gt_joints(frames: list[dict], ankle_fallback: bool = True) -> tuple[np.ndarray, np.ndarray]:
+def extract_gt_joints(
+    frames: list[dict],
+    bvh_path: Path,
+    drop_calibration_frame: bool,
+) -> tuple[np.ndarray, np.ndarray]:
     """Build (T, 22, 3) array of 3D joint positions and per-joint weights.
+
+    Uses lafan1's per-frame world joint positions for regular joints, and a
+    dedicated BVH End-Site parser for the two foot-tip entries (SMPL 10 / 11).
 
     Returns:
         gt_joints: (T, 22, 3) float32 — positions for SMPL joints 0..21 (L_hand/R_hand skipped).
-        weights:   (22,) float32 — 1 for real joints, 0 for the two end-site foot tips
-                   (indices 10, 11) when ankle_fallback is used.
+        weights:   (22,) float32 — 1 where we have a real target, 0 only if we had to
+                   fall back to an ankle position (end-site parse failed).
     """
     T = len(frames)
-    mapping = AXIS_BVH_TO_SMPL[:22]  # ignore SMPL 22/23 (L_hand/R_hand)
+    mapping = AXIS_BVH_TO_SMPL[:22]
     gt = np.zeros((T, 22, 3), dtype=np.float32)
     weights = np.ones(22, dtype=np.float32)
+
+    end_parents = sorted({bone for (kind, bone) in mapping if kind == "end"})
+    end_sites = compute_axis_bvh_end_site_world(
+        bvh_path, end_parents, drop_calibration_frame=drop_calibration_frame,
+    )
 
     for smpl_idx, (kind, bone) in enumerate(mapping):
         if kind == "joint":
@@ -71,13 +87,18 @@ def extract_gt_joints(frames: list[dict], ankle_fallback: bool = True) -> tuple[
                     )
                 gt[t, smpl_idx] = frame[bone][0]
         elif kind == "end":
-            # L_foot (10) / R_foot (11) end-site tips — not directly available from the
-            # lafan1 loader. Fall back to the parent ankle joint position and zero the weight.
-            fallback_bone = {"LeftFoot": "LeftFoot", "RightFoot": "RightFoot"}[bone]
-            for t, frame in enumerate(frames):
-                gt[t, smpl_idx] = frame[fallback_bone][0]
-            if ankle_fallback:
+            arr = end_sites.get(bone)
+            if arr is None or arr.shape[0] != T:
+                # End Site parse failed. Fall back to the parent joint and zero the weight
+                # so this joint does not pollute the fit.
+                print(f"[extract_gt_joints] end-site for {bone!r} unavailable "
+                      f"(got shape {None if arr is None else arr.shape}); using ankle fallback "
+                      f"with weight 0 for SMPL index {smpl_idx}.")
+                for t, frame in enumerate(frames):
+                    gt[t, smpl_idx] = frame[bone][0]
                 weights[smpl_idx] = 0.0
+            else:
+                gt[:, smpl_idx] = arr
         else:
             raise ValueError(f"unknown source kind {kind!r}")
     return gt, weights
@@ -122,7 +143,10 @@ def main() -> None:
     )
     print(f"  -> {len(frames)} frames @ {bvh_fps} fps")
 
-    gt_joints, weights = extract_gt_joints(frames, ankle_fallback=True)
+    gt_joints, weights = extract_gt_joints(
+        frames, bvh_path=args.bvh_file,
+        drop_calibration_frame=not args.keep_axis_calibration_frame,
+    )
     print(f"  gt_joints: {gt_joints.shape}  dtype={gt_joints.dtype}")
     print(f"  fit-joint weights: 1={int((weights==1).sum())}  0={int((weights==0).sum())}")
 

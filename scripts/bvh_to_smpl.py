@@ -50,6 +50,17 @@ def parse_args() -> argparse.Namespace:
                    help="Output fps (SONIC standard = 50). Set equal to input BVH fps to skip resampling.")
     p.add_argument("--keep_axis_calibration_frame", action="store_true",
                    help="Do NOT drop BVH frame 0 (by default it's dropped for axis format).")
+    # ---- VPoser pose-prior options ----
+    p.add_argument("--use_vposer", type=lambda v: str(v).lower() not in {"0", "false", "no"},
+                   default=True,
+                   help="Replace per-joint body 6-D with a 32-D VPoser latent. Default True.")
+    p.add_argument("--no_vposer", dest="use_vposer", action="store_false",
+                   help="Disable VPoser (use direct 6-D body parameterisation).")
+    p.add_argument("--vposer_dir", type=Path,
+                   default=Path(__file__).resolve().parent.parent / "assets" / "vposer_v1_0",
+                   help="Directory containing the VPoser snapshot (TR00_E096.pt etc.).")
+    p.add_argument("--vposer_weight", type=float, default=0.1,
+                   help="Weight on the VPoser ||z||^2 prior (SMPLify-X default 0.1).")
     return p.parse_args()
 
 
@@ -189,6 +200,9 @@ def main() -> None:
         smpl_model_dir=str(args.smpl_model_dir),
         gender=args.gender,
         device=args.device,
+        use_vposer=bool(args.use_vposer),
+        vposer_dir=str(args.vposer_dir),
+        vposer_weight=float(args.vposer_weight),
     )
     fitter = BatchSmplxFitter(cfg).with_joint_weights(weights)
     result = fitter.fit_clip(gt_joints, fps=float(bvh_fps))

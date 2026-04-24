@@ -15,10 +15,20 @@ Improvements vs v2:
   * Passes rotation matrices (not just axis-angle) to the loss so that
     temporal smoothness and hinge penalties operate in SO(3) where they are
     well-defined.
+
+VPoser integration (v4):
+  * Replaces the per-joint 6-D body-pose variable with a 32-D VPoser latent
+    that is decoded to 21 joint rotation matrices via the pre-trained body
+    pose VAE. VPoser's prior (||z||^2 with weight ~0.1 a la SMPLify-X)
+    rules out implausible joint configurations that the per-joint hinge /
+    angle priors could not detect (twisted ankles, hyperextended knees,
+    pelvis floating/reaching past joint limits).
+  * Global orient stays in 6-D so the model is free to face any direction.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import smplx
@@ -48,12 +58,53 @@ class FitterConfig:
     lr_C: float = 0.005
     fit_joint_count: int = 22
     log_every: int = 50
+    # ---- VPoser settings ----
+    use_vposer: bool = True
+    vposer_dir: str = "assets/vposer_v1_0"
+    vposer_weight: float = 0.1     # SMPLify-X-style ||z||^2 weight on the VPoser prior
 
 
 class BatchSmplxFitter:
     def __init__(self, cfg: FitterConfig):
         self.cfg = cfg
         self.device = torch.device(cfg.device if torch.cuda.is_available() else "cpu")
+        self._vposer = None
+        if self.cfg.use_vposer:
+            self._vposer = self._load_vposer(self.cfg.vposer_dir)
+
+    # ----- VPoser -----
+
+    def _load_vposer(self, vposer_dir: str):
+        """Load a frozen VPoser snapshot. Returns None if loading fails."""
+        try:
+            from human_body_prior.tools.model_loader import load_vposer
+        except Exception as exc:
+            raise RuntimeError(
+                f"--use_vposer requested but human_body_prior is not importable: {exc}"
+            )
+        vposer, _ = load_vposer(vposer_dir, vp_model="snapshot")
+        vposer = vposer.to(self.device)
+        vposer.eval()
+        # Freeze - we never want VPoser weights to receive gradients
+        for p in vposer.parameters():
+            p.requires_grad_(False)
+        return vposer
+
+    def _decode_vposer(self, z: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Decode VPoser latent -> (body_R: (T,21,3,3), body_aa: (T,63)).
+
+        The pip-installed VPoser snapshot's `decode(z, output_type='aa')` path is
+        broken on torch>=1.6 due to a torchgeometry incompatibility (`1 - bool_mask`).
+        We use the matrix output (`output_type='matrot'`) which returns a
+        (T, 1, 21, 9) tensor, reshape to rotation matrices, and convert to
+        axis-angle with our own `matrix_to_axis_angle` helper for the SMPL-X
+        forward call.
+        """
+        T = z.shape[0]
+        out = self._vposer.decode(z, output_type="matrot")  # (T, 1, 21, 9)
+        body_R = out.view(T, 21, 3, 3)
+        body_aa = matrix_to_axis_angle(body_R).reshape(T, 63)
+        return body_R, body_aa
 
     # ----- model / forward helpers -----
 
@@ -111,7 +162,14 @@ class BatchSmplxFitter:
         # -------- initialise --------
         # Start from identity rotations; Adam finds global_orient in stage A.
         go_r6 = identity_rot6d(T, device=self.device).requires_grad_(True)             # (T, 6)
-        body_r6 = identity_rot6d(T, 21, device=self.device).requires_grad_(True)       # (T, 21, 6)
+        # Body pose: VPoser latent (T, 32) starting at zero (=> mean pose) when enabled,
+        # otherwise per-joint 6-D as before.
+        if self.cfg.use_vposer:
+            z = torch.zeros(T, 32, device=self.device, requires_grad=True)
+            body_r6 = None
+        else:
+            z = None
+            body_r6 = identity_rot6d(T, 21, device=self.device).requires_grad_(True)   # (T, 21, 6)
         betas = torch.zeros(1, self.cfg.num_betas, device=self.device, requires_grad=True)
 
         # Initial transl: pelvis target minus rest pelvis offset, computed with betas=0
@@ -122,13 +180,34 @@ class BatchSmplxFitter:
         transl = transl_init.detach().clone().requires_grad_(True)
 
         def pack_axis_angle():
-            """Compute (go_aa, body_aa, joint_R) from the 6-D parameters."""
+            """Compute (go_aa, body_aa, joint_R) from the active body parameterisation."""
             go_R = rot6d_to_matrix(go_r6)                    # (T, 3, 3)
-            body_R = rot6d_to_matrix(body_r6)                # (T, 21, 3, 3)
             go_aa = matrix_to_axis_angle(go_R)               # (T, 3)
-            body_aa = matrix_to_axis_angle(body_R).reshape(T, 63)
+            if self.cfg.use_vposer:
+                body_R, body_aa = self._decode_vposer(z)     # (T, 21, 3, 3), (T, 63)
+            else:
+                body_R = rot6d_to_matrix(body_r6)            # (T, 21, 3, 3)
+                body_aa = matrix_to_axis_angle(body_R).reshape(T, 63)
             joint_R = torch.cat([go_R.unsqueeze(1), body_R], dim=1)  # (T, 22, 3, 3)
             return go_aa, body_aa, joint_R
+
+        def pack_axis_angle_frozen_body():
+            """Stage A helper: compute joint_R with body fixed at the current body
+            parameter state but detached so its gradients are zero. For VPoser this
+            means decoding z=0 (mean pose) frozen; for 6-D it means the identity rot."""
+            go_R = rot6d_to_matrix(go_r6)
+            go_aa = matrix_to_axis_angle(go_R)
+            if self.cfg.use_vposer:
+                with torch.no_grad():
+                    z_zero = torch.zeros(T, 32, device=self.device)
+                    body_R0, body_aa0 = self._decode_vposer(z_zero)
+            else:
+                body_R0 = rot6d_to_matrix(body_r6.detach())
+                body_aa0 = matrix_to_axis_angle(body_R0).reshape(T, 63)
+            body_R0 = body_R0.detach()
+            body_aa0 = body_aa0.detach()
+            joint_R = torch.cat([go_R.unsqueeze(1), body_R0], dim=1)
+            return go_aa, body_aa0, joint_R
 
         # -------- loss configurations per stage --------
         # Loss terms are averaged over (T, ...). data term is per-joint squared Euclidean
@@ -141,6 +220,8 @@ class BatchSmplxFitter:
             smooth_rot=0.0, smooth_transl=0.0,
         )
         # Stage B: activate body pose, almost pure data fit so positions match tightly.
+        # With VPoser active we let body_pose_l2 stay tiny (the VPoser prior on z is the
+        # principled regulariser).
         w_B = Smpl3DLossWeights(
             data=100.0, body_pose_l2=0.001, shape_l2=0.005, angle_prior=0.0,
             smooth_rot=0.01, smooth_transl=0.001,
@@ -156,24 +237,22 @@ class BatchSmplxFitter:
         loss_B = Smpl3DFittingLoss(w_B, self._jw_tensor).to(self.device)
         loss_C = Smpl3DFittingLoss(w_C, self._jw_tensor).to(self.device)
 
+        def vposer_prior(z_var: Optional[torch.Tensor]) -> torch.Tensor:
+            if z_var is None:
+                return torch.zeros((), device=self.device)
+            return z_var.pow(2).sum(-1).mean()
+
         # -------- stage A: freeze body rotations, only optimise global_orient + transl --------
         # (equivalent to optimising just the "where is the body" part)
-        body_r6_frozen = body_r6.detach()
         opt_A = torch.optim.Adam([go_r6, transl, betas], lr=self.cfg.lr_A)
-        print(f"[fitter] stage A: global orient + transl, {self.cfg.n_iters_A} iters")
+        print(f"[fitter] stage A: global orient + transl, {self.cfg.n_iters_A} iters"
+              f" (use_vposer={self.cfg.use_vposer})")
         for it in range(self.cfg.n_iters_A):
             opt_A.zero_grad()
-            go_aa, body_aa, joint_R = pack_axis_angle()
-            # replace body_r6 rotation with frozen identity (by nullifying its gradient path)
-            body_aa_frozen = matrix_to_axis_angle(rot6d_to_matrix(body_r6_frozen)).reshape(T, 63)
-            body_aa_frozen = body_aa_frozen.detach()
+            go_aa, body_aa_frozen, joint_R_A = pack_axis_angle_frozen_body()
             out = self._forward(model, go_aa, body_aa_frozen, transl, betas)
             pred = out.joints[:, : self.cfg.fit_joint_count]
             body_pose_aa = body_aa_frozen.reshape(T, 21, 3)
-            joint_R_A = torch.cat(
-                [rot6d_to_matrix(go_r6).unsqueeze(1), rot6d_to_matrix(body_r6_frozen).expand(T, -1, -1, -1)],
-                dim=1,
-            )
             total, logs = loss_A(pred, gt, betas, body_pose_aa, joint_R_A, transl)
             total.backward()
             opt_A.step()
@@ -181,7 +260,8 @@ class BatchSmplxFitter:
                 print(f"  A it={it:3d}  total={logs['total']:.4f}  data={logs['data']:.4f}")
 
         # -------- stage B: body pose + priors, gentle smoothness --------
-        opt_B = torch.optim.Adam([go_r6, body_r6, transl, betas], lr=self.cfg.lr_B)
+        body_params = [z] if self.cfg.use_vposer else [body_r6]
+        opt_B = torch.optim.Adam([go_r6] + body_params + [transl, betas], lr=self.cfg.lr_B)
         print(f"[fitter] stage B: body fit, {self.cfg.n_iters_B} iters")
         for it in range(self.cfg.n_iters_B):
             opt_B.zero_grad()
@@ -189,18 +269,21 @@ class BatchSmplxFitter:
             out = self._forward(model, go_aa, body_aa, transl, betas)
             pred = out.joints[:, : self.cfg.fit_joint_count]
             body_pose_aa = body_aa.reshape(T, 21, 3)
-            total, logs = loss_B(pred, gt, betas, body_pose_aa, joint_R, transl)
+            base_total, logs = loss_B(pred, gt, betas, body_pose_aa, joint_R, transl)
+            vp = vposer_prior(z)
+            total = base_total + self.cfg.vposer_weight * vp
             total.backward()
             opt_B.step()
             if it % self.cfg.log_every == 0 or it == self.cfg.n_iters_B - 1:
                 print(
-                    f"  B it={it:3d}  tot={logs['total']:.4f}  data={logs['data']:.4f} "
-                    f"pose_l2={logs['pose_l2']:.3f} knee={logs['knee_hinge']:.3f} "
-                    f"ankle_twist={logs['ankle_twist']:.3f} smooth_rot={logs['smooth_rot']:.3f}"
+                    f"  B it={it:3d}  tot={float(total.detach()):.4f}  data={logs['data']:.4f} "
+                    f"pose_l2={logs['pose_l2']:.3f} vp={float(vp.detach()):.3f} "
+                    f"knee={logs['knee_hinge']:.3f} ankle_twist={logs['ankle_twist']:.3f} "
+                    f"smooth_rot={logs['smooth_rot']:.3f}"
                 )
 
         # -------- stage C: full priors + strong smoothness --------
-        opt_C = torch.optim.Adam([go_r6, body_r6, transl, betas], lr=self.cfg.lr_C)
+        opt_C = torch.optim.Adam([go_r6] + body_params + [transl, betas], lr=self.cfg.lr_C)
         print(f"[fitter] stage C: refine w/ priors + smoothness, {self.cfg.n_iters_C} iters")
         for it in range(self.cfg.n_iters_C):
             opt_C.zero_grad()
@@ -208,15 +291,17 @@ class BatchSmplxFitter:
             out = self._forward(model, go_aa, body_aa, transl, betas)
             pred = out.joints[:, : self.cfg.fit_joint_count]
             body_pose_aa = body_aa.reshape(T, 21, 3)
-            total, logs = loss_C(pred, gt, betas, body_pose_aa, joint_R, transl)
+            base_total, logs = loss_C(pred, gt, betas, body_pose_aa, joint_R, transl)
+            vp = vposer_prior(z)
+            total = base_total + self.cfg.vposer_weight * vp
             total.backward()
             opt_C.step()
             if it % self.cfg.log_every == 0 or it == self.cfg.n_iters_C - 1:
                 print(
-                    f"  C it={it:3d}  tot={logs['total']:.4f}  data={logs['data']:.4f} "
-                    f"pose_l2={logs['pose_l2']:.3f} knee={logs['knee_hinge']:.3f} "
-                    f"elbow={logs['elbow_hinge']:.3f} ankle_twist={logs['ankle_twist']:.3f} "
-                    f"smooth_rot={logs['smooth_rot']:.3f}"
+                    f"  C it={it:3d}  tot={float(total.detach()):.4f}  data={logs['data']:.4f} "
+                    f"pose_l2={logs['pose_l2']:.3f} vp={float(vp.detach()):.3f} "
+                    f"knee={logs['knee_hinge']:.3f} elbow={logs['elbow_hinge']:.3f} "
+                    f"ankle_twist={logs['ankle_twist']:.3f} smooth_rot={logs['smooth_rot']:.3f}"
                 )
 
         # -------- final forward pass (transl=0 for SONIC model-frame joints) --------

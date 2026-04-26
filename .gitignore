@@ -42,6 +42,7 @@ data/
 data_record/
 Download/
 assets/body_models/
+assets/vposer_v1_0/
 
 # Media files
 *.mp4

@@ -101,6 +101,7 @@ class GeneralMotionRetargeting:
             self.ik_limits.append(mink.VelocityLimit(self.model, VELOCITY_LIMITS)) 
             
         self.setup_retarget_configuration()
+        self.arm_segment_targets = self._compute_arm_segment_targets()
         
         self.ground_offset = 0.0
 
@@ -278,6 +279,8 @@ class GeneralMotionRetargeting:
         for body_name in human_data_local.keys():
             human_data_global[body_name] = (human_data_local[body_name] + scaled_root_pos, human_data[body_name][1])
 
+        human_data_global = self._apply_segmentwise_arm_scaling(human_data_global)
+
         return human_data_global
     
     def offset_human_data(self, human_data, pos_offsets, rot_offsets):
@@ -325,4 +328,64 @@ class GeneralMotionRetargeting:
         for body_name in human_data.keys():
             pos, quat = human_data[body_name]
             human_data[body_name][0] = pos - np.array([0, 0, self.ground_offset])
+        return human_data
+
+    def _compute_arm_segment_targets(self):
+        data = mj.MjData(self.model)
+        mj.mj_forward(self.model, data)
+        arm_targets = {}
+        body_chains = {
+            "Left": ("left_shoulder_yaw_link", "left_elbow_link", "left_wrist_yaw_link"),
+            "Right": ("right_shoulder_yaw_link", "right_elbow_link", "right_wrist_yaw_link"),
+        }
+        for side, (shoulder_name, elbow_name, wrist_name) in body_chains.items():
+            if (
+                shoulder_name not in self.robot_body_names
+                or elbow_name not in self.robot_body_names
+                or wrist_name not in self.robot_body_names
+            ):
+                continue
+            shoulder = data.xpos[self.robot_body_names[shoulder_name]].copy()
+            elbow = data.xpos[self.robot_body_names[elbow_name]].copy()
+            wrist = data.xpos[self.robot_body_names[wrist_name]].copy()
+            arm_targets[side] = {
+                "upper": np.linalg.norm(elbow - shoulder),
+                "lower": np.linalg.norm(wrist - elbow),
+            }
+        return arm_targets
+
+    def _apply_segmentwise_arm_scaling(self, human_data):
+        arm_bodies = {
+            "Left": ("LeftArm", "LeftForeArm", "LeftHand"),
+            "Right": ("RightArm", "RightForeArm", "RightHand"),
+        }
+        for side, (shoulder_name, elbow_name, wrist_name) in arm_bodies.items():
+            if side not in self.arm_segment_targets:
+                continue
+            if (
+                shoulder_name not in human_data
+                or elbow_name not in human_data
+                or wrist_name not in human_data
+            ):
+                continue
+
+            shoulder_pos = human_data[shoulder_name][0]
+            elbow_pos = human_data[elbow_name][0]
+            wrist_pos = human_data[wrist_name][0]
+
+            upper_vec = elbow_pos - shoulder_pos
+            upper_len = np.linalg.norm(upper_vec)
+            if upper_len > 1e-8:
+                target_upper = min(upper_len, self.arm_segment_targets[side]["upper"])
+                elbow_pos = shoulder_pos + upper_vec / upper_len * target_upper
+
+            lower_vec = wrist_pos - human_data[elbow_name][0]
+            lower_len = np.linalg.norm(lower_vec)
+            if lower_len > 1e-8:
+                target_lower = min(lower_len, self.arm_segment_targets[side]["lower"])
+                wrist_pos = elbow_pos + lower_vec / lower_len * target_lower
+
+            human_data[elbow_name] = (elbow_pos, human_data[elbow_name][1])
+            human_data[wrist_name] = (wrist_pos, human_data[wrist_name][1])
+
         return human_data

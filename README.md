@@ -229,6 +229,41 @@ Each frame of **human motion data** is formulated as a dict of (human_body_name,
 
 Each frame of **robot motion data** can be understood as a tuple of (robot_base_translation, robot_base_rotation, robot_joint_positions).
 
+## Canonical BVH Folder Pipeline
+
+For batch retargeting custom BVH clips into grounded G1 motion assets, the
+canonical upstream pipeline is:
+
+- [`scripts/retarget_bvh_folder_to_g1.py`](scripts/retarget_bvh_folder_to_g1.py)
+- [`scripts/pkl_to_grounded_csv.py`](scripts/pkl_to_grounded_csv.py)
+
+This pipeline:
+
+- copies the original BVH into each take directory
+- strips finger joints into a cleaned BVH
+- retargets to G1 using GMR
+- applies iterative contact-aware stance grounding to the robot root
+- exports the grounded G1 PKL and grounded 30 fps CSV
+- renders a grounded MuJoCo MP4 from the same PKL
+
+Example:
+
+```bash
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+
+python scripts/retarget_bvh_folder_to_g1.py \
+    --motions-dir /path/to/motions/force_tracker \
+    --output-dir /path/to/outputs_force_tracker \
+    --pattern 'take*_chr00.bvh' \
+    --format axis \
+    --robot unitree_g1 \
+    --human-height 1.85 \
+    --camera-lookat-z-offset 0.10 \
+    --grounding-passes 2 \
+    --force
+```
+
 ## Usage
 
 ### [NEW] PICO Streaming to Robot (TWIST2)

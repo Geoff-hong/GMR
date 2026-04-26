@@ -146,15 +146,15 @@ if __name__ == "__main__":
                 follow_camera=True,
             )
 
+        if args.save_path is not None:
+            qpos_list.append(qpos)
+
         if args.loop:
             i = (i + 1) % len(lafan1_data_frames)
         else:
             i += 1
             if i >= len(lafan1_data_frames):
                 break
-
-        if args.save_path is not None:
-            qpos_list.append(qpos)
 
     if args.save_path is not None:
         import pickle

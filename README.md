@@ -231,8 +231,56 @@ Each frame of **robot motion data** can be understood as a tuple of (robot_base_
 
 ## Canonical BVH Folder Pipeline
 
+This section is the recommended new-machine quickstart for converting Axis
+Studio / Noitom BVH captures into grounded Unitree G1 motion assets. This
+pipeline is fully owned by GMR: **GR00T-WholeBodyControl is not required** for
+BVH-to-G1 retargeting. Use GR00T only later if you want to package the output
+for SONIC evaluation or training.
+
+Use the latest `master` branch on a fresh machine. The old
+`feature/axis-studio-retarget` branch was an intermediate branch; its changes
+are already included in `master`, along with the later G1 arm retargeting and
+contact-aware grounding fixes.
+
+```bash
+git clone https://github.com/Geoff-hong/GMR.git
+cd GMR
+git checkout master
+git pull --ff-only origin master
+```
+
+Create and install the environment:
+
+```bash
+conda create -n gmr python=3.10 -y
+conda activate gmr
+
+pip install -e .
+conda install -c conda-forge libstdcxx-ng -y
+```
+
+For headless MuJoCo rendering, set:
+
+```bash
+export MUJOCO_GL=egl
+export PYOPENGL_PLATFORM=egl
+```
+
+Run a quick import/smoke test before processing a dataset:
+
+```bash
+python - <<'PY'
+import imageio
+import mujoco
+from general_motion_retargeting import GeneralMotionRetargeting
+print("GMR Axis->G1 dependencies OK")
+PY
+
+python scripts/retarget_bvh_folder_to_g1.py --help
+```
+
 For batch retargeting custom BVH clips into grounded G1 motion assets, the
-canonical upstream pipeline is:
+canonical pipeline is:
 
 - [`scripts/retarget_bvh_folder_to_g1.py`](scripts/retarget_bvh_folder_to_g1.py)
 - [`scripts/pkl_to_grounded_csv.py`](scripts/pkl_to_grounded_csv.py)
@@ -246,9 +294,10 @@ This pipeline:
 - exports the grounded G1 PKL and grounded 30 fps CSV
 - renders a grounded MuJoCo MP4 from the same PKL
 
-Example:
+Example for Axis Studio / Noitom BVH files:
 
 ```bash
+conda activate gmr
 export MUJOCO_GL=egl
 export PYOPENGL_PLATFORM=egl
 
@@ -263,6 +312,89 @@ python scripts/retarget_bvh_folder_to_g1.py \
     --grounding-passes 2 \
     --force
 ```
+
+The input folder should contain BVH files matching `--pattern`, for example:
+
+```text
+/path/to/motions/force_tracker/
+  take003_chr00.bvh
+  take004_chr00.bvh
+  take005_chr00.bvh
+```
+
+For each take `<stem>`, the output layout is:
+
+```text
+<output-dir>/
+  retarget_manifest.json
+  <stem>/
+    <stem>.bvh                 # copied original BVH
+    <stem>_clean.bvh           # finger-stripped BVH used for retargeting
+    <stem>.pkl                 # grounded G1 motion PKL
+    <stem>.csv                 # grounded 30 fps CSV for downstream control
+    <stem>_robot.mp4           # MuJoCo render from the grounded PKL
+    <stem>_report.json         # BVH cleaning/finger-stripping report
+    <stem>_csv_report.json     # grounding/export diagnostics
+```
+
+After the run, verify the batch manifest:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+out = Path("/path/to/outputs_force_tracker")
+manifest = json.loads((out / "retarget_manifest.json").read_text())
+print("source_count:", manifest["source_count"])
+print("processed_count:", manifest["processed_count"])
+print("skipped_count:", manifest["skipped_count"])
+assert manifest["processed_count"] == manifest["source_count"]
+assert manifest["skipped_count"] == 0
+PY
+```
+
+Then spot-check the grounding reports:
+
+```bash
+python - <<'PY'
+import json
+from pathlib import Path
+
+out = Path("/path/to/outputs_force_tracker")
+reports = sorted(out.glob("take*_chr00/*_csv_report.json"))
+assert reports, "No grounding reports found"
+for report_path in reports[:5]:
+    report = json.loads(report_path.read_text())
+    grounding = report["grounding_report"]
+    print(
+        report_path.parent.name,
+        grounding["mode"],
+        "stance_p95_m=", grounding["stance_abs_height_after_p95_m"],
+        "stance_max_m=", grounding["stance_abs_height_after_max_m"],
+    )
+    assert grounding["mode"] == "iterative_contact_aware_foot_lock"
+PY
+```
+
+For good outputs, the stance contact heights should usually be at millimeter to
+low-centimeter scale. Always inspect several `<stem>_robot.mp4` files visually:
+the support foot should not persistently float above the floor, and swing-foot
+airborne phases should still be preserved.
+
+Common notes:
+
+- `--format axis` enables Axis Studio / Noitom BVH parsing.
+- Axis Studio exports often include a frame-0 calibration T-pose. GMR drops
+  that calibration frame by default for `--format axis`.
+- `--human-height` should be the captured subject height in meters; it affects
+  human-to-G1 scaling.
+- `--grounding-passes 2` is the recommended default for contact-aware stance
+  grounding.
+- If `python scripts/retarget_bvh_folder_to_g1.py --help` fails with a missing
+  Python package, rerun `pip install -e .` inside the `gmr` environment.
+- If MP4 rendering fails on a headless machine, confirm `MUJOCO_GL=egl` and
+  `PYOPENGL_PLATFORM=egl` are exported before running the script.
 
 ## Usage
 
